@@ -835,3 +835,87 @@ def test_all_variants_require_utc_label_on_absolute_clock_times() -> None:
     for name in ("EPISODE_GENERATION_PROMPT", "USER_EPISODE_GENERATION_PROMPT"):
         assert "MUST carry the UTC zone label" in getattr(en_mod, name)
         assert "must NOT begin with a timestamp" not in getattr(en_mod, name)
+# ==========================================================================
+# Episode conversation token cap (EverAlgo #9): 48,000 real tokens, 60% head / 40% tail
+# ==========================================================================
+
+_CONV_TOKEN_CAP = 48_000
+_CONV_OMISSION = "\n[... conversation truncated: middle omitted ...]\n"
+_SMALL_GOLDEN = (
+    "\n                {\n"
+    '                    "timestamp": 2023-11-14 22:13 UTC (Tuesday),\n'
+    "                    \"speaker\": Alice,\n"
+    "                    \"content\": Schedule a meeting with Alice at 3pm\n"
+    "                }\n"
+    "\n                {\n"
+    '                    "timestamp": 2023-11-14 22:13 UTC (Tuesday),\n'
+    "                    \"speaker\": assistant,\n"
+    "                    \"content\": Done. Sent invite for 3pm.\n"
+    "                }"
+)
+
+
+def _long_memcell(n: int, body_words: int) -> MemCell:
+    items = [
+        ChatMessage(
+            id=f"m{i}",
+            role="user",
+            content=f"message {i} " + "lorem ipsum dolor " * body_words,
+            timestamp=1700000000000 + i * 1000,
+            sender_id="u_alice",
+            sender_name="Alice",
+        )
+        for i in range(n)
+    ]
+    return MemCell(items=items, timestamp=1700000000000 + n * 1000)
+
+
+def test_render_conversation_small_input_byte_identical() -> None:
+    """Below the cap the rendering is unchanged from the uncapped baseline output."""
+    assert _render_conversation(_memcell()) == _SMALL_GOLDEN
+
+
+def test_render_conversation_caps_long_conversation_at_48k_tokens() -> None:
+    from everalgo._tokenize import count_tokens
+
+    rendered = _render_conversation(_long_memcell(n=300, body_words=150))
+    assert _CONV_OMISSION in rendered
+    assert count_tokens(rendered) <= _CONV_TOKEN_CAP
+
+
+def test_render_conversation_keeps_60_40_head_tail_with_marker_inside_cap() -> None:
+    from everalgo._tokenize import count_tokens
+
+    rendered = _render_conversation(_long_memcell(n=300, body_words=150))
+    head, tail = rendered.split(_CONV_OMISSION)
+    assert "message 0 " in head
+    assert "message 299 " in tail
+    budget = _CONV_TOKEN_CAP - count_tokens(_CONV_OMISSION)
+    assert abs(count_tokens(head) - 0.6 * budget) <= 8
+    assert abs(count_tokens(tail) - 0.4 * budget) <= 8
+    assert count_tokens(rendered) <= _CONV_TOKEN_CAP
+
+
+def test_render_conversation_truncates_single_oversized_message() -> None:
+    from everalgo._tokenize import count_tokens
+
+    rendered = _render_conversation(_long_memcell(n=1, body_words=60_000))
+    assert _CONV_OMISSION in rendered
+    assert count_tokens(rendered) <= _CONV_TOKEN_CAP
+    head, tail = rendered.split(_CONV_OMISSION)
+    assert "message 0 " in head
+    assert "lorem ipsum dolor" in tail
+
+
+@pytest.mark.parametrize("sender_id", ["u_alice", None])
+async def test_aextract_summary_and_user_branches_send_capped_conversation(sender_id: str | None) -> None:
+    """Both prompt branches (user and non-user) share the capped conversation renderer."""
+    from everalgo._tokenize import count_tokens
+
+    fake = FakeLLMClient(responses=[ChatResponse(content='{"title": "T", "content": "c", "summary": "Preview of c"}', model="fake")])
+    await EpisodeExtractor(llm=fake).aextract(_long_memcell(n=300, body_words=150), sender_id=sender_id)
+
+    prompt = "\n".join(str(m.content) for m in fake.calls[0].messages)
+    assert _CONV_OMISSION in prompt
+    assert "message 0 " in prompt and "message 299 " in prompt
+    assert count_tokens(prompt) < _CONV_TOKEN_CAP + 20_000
