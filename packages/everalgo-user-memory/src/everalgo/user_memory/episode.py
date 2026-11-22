@@ -11,6 +11,7 @@ from asgiref.sync import async_to_sync
 from everalgo.llm.types import ChatMessage as LLMChatMessage
 from everalgo.prompts import render_prompt
 from everalgo.types import Episode, MemCell
+from everalgo._tokenize import _get_tokenizer, count_tokens
 from everalgo.user_memory._render import chat_messages, render_content
 from everalgo.user_memory.prompts.en.episode import (
     DEFAULT_CUSTOM_INSTRUCTIONS,
@@ -170,6 +171,32 @@ def _format_prompt_time(timestamp_ms: int) -> str:
     return f"{dt:%Y-%m-%d %H:%M} UTC ({dt:%A})"
 
 
+_CONV_TOKEN_CAP = 48_000
+_CONV_HEAD_RATIO = 0.6
+_CONV_OMISSION = "\n[... conversation truncated: middle omitted ...]\n"
+
+
+def _cap_conversation(text: str) -> str:
+    """Bound ``text`` to ``_CONV_TOKEN_CAP`` real tokens, keeping 60% head and 40% tail.
+
+    Text within the cap is returned unchanged. Otherwise the budget left after the omission
+    marker is split by token count. The marker is counted, so the result stays within the cap,
+    and a single oversized message goes through the same cut.
+    """
+    if count_tokens(text) <= _CONV_TOKEN_CAP:
+        return text
+    enc = _get_tokenizer()
+    ids = enc.encode(text, disallowed_special=())
+    budget = _CONV_TOKEN_CAP - count_tokens(_CONV_OMISSION)
+    while True:
+        head_n = int(budget * _CONV_HEAD_RATIO)
+        tail_n = budget - head_n
+        capped = enc.decode(ids[:head_n]) + _CONV_OMISSION + enc.decode(ids[len(ids) - tail_n :])
+        if count_tokens(capped) <= _CONV_TOKEN_CAP:
+            return capped
+        budget -= 1
+
+
 def _render_conversation(memcell: MemCell) -> str:
     """Render ChatMessage items as pseudo-JSON per message.
 
@@ -201,4 +228,4 @@ def _render_conversation(memcell: MemCell) -> str:
                     "content": {text}
                 }}"""
             )
-    return "\n".join(lines)
+    return _cap_conversation("\n".join(lines))
